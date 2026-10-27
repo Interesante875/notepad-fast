@@ -620,25 +620,22 @@ impl Document {
     /// cleared because it refers to the previous file's bytes.
     pub fn commit_save(&mut self, path: &Path, written: WrittenFile) -> io::Result<()> {
         let WrittenFile { tmp, index } = written;
-        // Windows refuses to replace a file that is still mapped, so release
-        // our mapping first and restore it if the rename fails.
+        // Windows refuses to replace a file that is still mapped, so drop our
+        // mapping before the rename, keeping just enough to re-map it if the
+        // rename fails.
         let released = if cfg!(windows) && matches!(*self.orig.bytes, Bytes::Mapped(_)) {
-            Some(std::mem::replace(&mut self.orig, Arc::new(Source::empty())))
+            let old = std::mem::replace(&mut self.orig, Arc::new(Source::empty()));
+            Some((old.path.clone(), old.index.clone()))
         } else {
             None
         };
         if let Err(e) = fs::rename(&tmp, path) {
             let _ = fs::remove_file(&tmp);
-            if let Some(old) = released {
-                let (old_path, old_index) = (old.path.clone(), old.index.clone());
-                drop(old);
-                if let Some(p) = old_path {
-                    self.orig = Arc::new(Source { bytes: map_file(&p)?, index: old_index, path: Some(p) });
-                }
+            if let Some((Some(p), old_index)) = released {
+                self.orig = Arc::new(Source { bytes: map_file(&p)?, index: old_index, path: Some(p) });
             }
             return Err(e);
         }
-        drop(released);
 
         let bytes = map_file(path)?;
         self.orig = Arc::new(Source { bytes, index, path: Some(path.to_path_buf()) });
