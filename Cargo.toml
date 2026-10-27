@@ -17,11 +17,21 @@ path = "src/main.rs"
 [dependencies]
 memchr = "2.7"
 memmap2 = "0.9"
-eframe = { version = "0.37", default-features = false, features = ["default_fonts", "glow", "persistence", "wayland", "x11"] }
+eframe = { version = "0.37", default-features = false, features = [
+    "clipboard",     # system clipboard for copy / cut / paste
+    "default_fonts",
+    "glow",
+    "persistence",
+    "system_fonts",  # on-demand fallback to OS fonts for CJK, Arabic, Devanagari, ...
+    "wayland",
+    "x11",
+] }
 egui = "0.37"
 rfd = "0.17"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 serde = { version = "1", features = ["derive"] }
+unicode-segmentation = "1"
+unicode-width = "0.2"
 
 [dev-dependencies]
 tempfile = "3"

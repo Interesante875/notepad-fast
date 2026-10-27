@@ -1,77 +1,14 @@
 //! Headless UI tests: drive the real application through egui with
 //! synthetic keyboard / mouse input, without opening a window.
 
+mod common;
+
 use std::io::Write;
 use std::time::{Duration, Instant};
 
-use egui::{Context, Event, FullOutput, Key, Modifiers, OutputCommand, Pos2, RawInput, Rect, Vec2};
-use notepad_fast::app::{NotepadApp, Settings};
-
-struct Harness {
-    ctx: Context,
-    app: NotepadApp,
-    time: f64,
-}
-
-impl Harness {
-    fn new(settings: Settings) -> Self {
-        let mut h = Harness { ctx: Context::default(), app: NotepadApp::new(settings), time: 0.0 };
-        h.frame(vec![]);
-        h.frame(vec![]);
-        h
-    }
-
-    fn frame(&mut self, events: Vec<Event>) -> FullOutput {
-        let input = RawInput {
-            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1000.0, 700.0))),
-            time: Some(self.time),
-            events,
-            focused: true,
-            ..Default::default()
-        };
-        self.time += 1.0 / 60.0;
-        let app = &mut self.app;
-        let mut out = self.ctx.run_ui(input, |ui| app.show(ui));
-        // No GPU here: drop the font-atlas uploads instead of applying them.
-        out.textures_delta.clear();
-        out
-    }
-
-    fn key(&mut self, key: Key, modifiers: Modifiers) -> FullOutput {
-        let ev = |pressed| Event::Key { key, physical_key: None, pressed, repeat: false, modifiers };
-        self.frame(vec![ev(true), ev(false)])
-    }
-
-    fn type_text(&mut self, s: &str) {
-        for c in s.chars() {
-            if c == '\n' {
-                self.key(Key::Enter, Modifiers::NONE);
-            } else {
-                self.frame(vec![Event::Text(c.to_string())]);
-            }
-        }
-    }
-
-    fn text(&self) -> String {
-        String::from_utf8(self.app.doc.read(0..self.app.doc.len()).into_owned()).unwrap()
-    }
-
-    fn wait_loaded(&mut self) {
-        let t = Instant::now();
-        while self.app.is_busy() {
-            assert!(t.elapsed() < Duration::from_secs(120), "loading timed out");
-            std::thread::sleep(Duration::from_millis(5));
-            self.frame(vec![]);
-        }
-    }
-}
-
-fn copied(out: &FullOutput) -> Option<String> {
-    out.platform_output.commands.iter().find_map(|c| match c {
-        OutputCommand::CopyText(t) => Some(t.clone()),
-        _ => None,
-    })
-}
+use common::{copied, Harness};
+use egui::{Event, Key, Modifiers, Pos2, Vec2};
+use notepad_fast::app::Settings;
 
 #[test]
 fn typing_editing_and_undo() {

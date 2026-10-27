@@ -186,3 +186,47 @@ fn empty_documents() {
     doc.save(&path).unwrap();
     assert_eq!(std::fs::read(&path).unwrap(), b"x");
 }
+
+#[test]
+fn undo_and_redo_survive_saves() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("notes.txt");
+    std::fs::write(&path, "one\n").unwrap();
+    let mut doc = Document::open(&path).unwrap();
+    let read = |d: &Document| String::from_utf8(d.read(0..d.len()).into_owned()).unwrap();
+    let disk = || std::fs::read_to_string(&path).unwrap();
+
+    doc.edit(4..4, b"two\n", EditKind::Other, (4, 4), (8, 8));
+    doc.save(&path).unwrap();
+    assert!(!doc.is_modified());
+    assert_eq!(disk(), "one\ntwo\n");
+
+    doc.edit(8..8, b"three\n", EditKind::Other, (8, 8), (14, 14));
+    doc.save(&path).unwrap();
+    assert_eq!(disk(), "one\ntwo\nthree\n");
+
+    // Undo past both saves; the document still reads the original bytes.
+    assert!(doc.undo().is_some());
+    assert!(doc.is_modified());
+    assert!(doc.undo().is_some());
+    assert_eq!(read(&doc), "one\n");
+    doc.save(&path).unwrap();
+    assert_eq!(disk(), "one\n");
+    assert!(!doc.is_modified());
+
+    // Redo is still available after saving.
+    assert!(doc.redo().is_some());
+    assert!(doc.redo().is_some());
+    assert_eq!(read(&doc), "one\ntwo\nthree\n");
+    assert!(doc.is_modified());
+    doc.save(&path).unwrap();
+    assert_eq!(disk(), "one\ntwo\nthree\n");
+
+    // Typing right after a save starts a new undo step.
+    doc.edit(14..14, b"4", EditKind::Typing, (14, 14), (15, 15));
+    doc.edit(15..15, b"5", EditKind::Typing, (15, 15), (16, 16));
+    doc.undo();
+    assert_eq!(read(&doc), "one\ntwo\nthree\n");
+    assert!(!doc.is_modified(), "back at the save point");
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1, "no temp files left");
+}

@@ -34,6 +34,27 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --release --all-targets
 
+  e2e:
+    name: end-to-end (real window, clipboard, input methods)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install X11 test tools, fonts and input methods
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb xdotool xclip imagemagick python3-xlib dbus-x11 \
+            ibus ibus-libpinyin ibus-hangul ibus-kkc fonts-noto-cjk fonts-noto-core \
+            libxkbcommon-x11-0 libgl1-mesa-dri
+      - run: cargo build --release
+      - run: mkdir -p e2e-shots && E2E_SHOTS=$PWD/e2e-shots scripts/e2e.sh native
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-screenshots
+          path: e2e-shots
+
   cross:
     name: cross-compile (${{ matrix.target }})
     strategy:

@@ -6,6 +6,9 @@
 //! position can be computed in O(1), so scrolling through them never needs
 //! to scan from the start of the line.
 
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthChar;
+
 use super::document::Document;
 
 pub const TAB_WIDTH: usize = 4;
@@ -81,12 +84,31 @@ pub fn display_char(c: char) -> char {
     }
 }
 
+/// Display width in columns: tabs run to the next tab stop, East Asian wide
+/// characters take two columns, combining marks take none.
 #[inline]
-fn char_width(c: char, col: usize) -> usize {
+pub fn char_width(c: char, col: usize) -> usize {
     if c == '\t' {
         TAB_WIDTH - col % TAB_WIDTH
+    } else if c.is_control() {
+        1 // shown as a placeholder dot
     } else {
-        1
+        UnicodeWidthChar::width(c).unwrap_or(1)
+    }
+}
+
+/// Like [`decode`], but yields whole grapheme clusters.
+fn clusters(bytes: &[u8], mut f: impl FnMut(usize, &str)) {
+    let mut off = 0;
+    for chunk in bytes.utf8_chunks() {
+        for (i, g) in chunk.valid().grapheme_indices(true) {
+            f(off + i, g);
+        }
+        off += chunk.valid().len();
+        for _ in chunk.invalid() {
+            f(off, "\u{FFFD}");
+            off += 1;
+        }
     }
 }
 
@@ -173,6 +195,7 @@ fn align(doc: &Document, pos: u64, end: u64) -> u64 {
 }
 
 /// Greedy word wrap of one line into rows of at most `cols` columns.
+/// Rows only ever break between grapheme clusters.
 fn wrap_rows(bytes: &[u8], base: u64, cols: usize) -> Vec<u64> {
     let mut rows = vec![base];
     let mut col = 0usize;
@@ -180,8 +203,9 @@ fn wrap_rows(bytes: &[u8], base: u64, cols: usize) -> Vec<u64> {
     // column there.
     let mut brk: Option<(usize, usize)> = None;
     let mut row_start = 0usize;
-    decode(bytes, |off, len, c| {
-        let w = char_width(c, col);
+    clusters(bytes, |off, g| {
+        let width = |col: usize| g.chars().fold(0, |w, c| w + char_width(c, col + w));
+        let w = width(col);
         if col + w > cols && col > 0 {
             match brk {
                 Some((b, bcol)) if b > row_start && b <= off => {
@@ -196,9 +220,9 @@ fn wrap_rows(bytes: &[u8], base: u64, cols: usize) -> Vec<u64> {
             rows.push(base + row_start as u64);
             brk = None;
         }
-        col += char_width(c, col);
-        if c == ' ' || c == '\t' {
-            brk = Some((off + len, col));
+        col += width(col);
+        if g == " " || g == "\t" {
+            brk = Some((off + g.len(), col));
         }
     });
     rows
@@ -248,6 +272,23 @@ mod tests {
             prev_end = e;
         }
         assert_eq!(prev_end, 100_000);
+    }
+
+    #[test]
+    fn wide_and_combining_characters() {
+        let d = Document::from_bytes("日本e\u{301}x");
+        let g = Layout { wrap: None }.glyphs(&d, 0, d.len());
+        let cols: Vec<_> = g.iter().map(|g| (g.col, g.width)).collect();
+        assert_eq!(cols, vec![(0, 2), (2, 2), (4, 1), (5, 0), (5, 1)]);
+        // Wrapping at 4 columns puts two ideographs per row and keeps
+        // "e + combining acute" together.
+        let d = Document::from_bytes("日本語ab\u{301}c");
+        let l = Layout { wrap: Some(4) };
+        let ll = l.line(&d, 0);
+        let rows: Vec<_> = (0..ll.row_count()).map(|k| l.row_range(&d, &ll, k)).collect();
+        let text: Vec<String> =
+            rows.iter().map(|&(s, e)| String::from_utf8(d.read(s..e).into_owned()).unwrap()).collect();
+        assert_eq!(text, vec!["日本", "語ab\u{301}", "c"]);
     }
 
     #[test]

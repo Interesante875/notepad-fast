@@ -36,6 +36,15 @@ Everything you expect from Notepad:
 
 Plus:
 
+- **Every language:** text is shaped properly (CJK, Korean, Arabic and Hebrew right-to-left, Devanagari, Thai,
+  Vietnamese, combining accents, emoji sequences). Missing glyphs are loaded on demand from the system fonts.
+- **Input methods (IME):** Chinese, Japanese, Korean and other input methods work, with the composition shown
+  inline at the cursor and the candidate window following it.
+- **System clipboard:** Cut / Copy / Paste via keyboard and the Edit menu; line endings are converted to the
+  file's convention on paste.
+- The cursor moves by user-perceived characters (an emoji with skin tone or a letter with an accent is one step);
+  Backspace removes one code point so accents can be corrected.
+- Undo / redo keep working after saving.
 - Line numbers and current-line highlight.
 - Three low-contrast themes: **Nocturne** (dark), **Paper** (warm light) and **Sepia** (low blue light).
 - Lightweight syntax colouring for JSON / JSON Lines (keys, strings, numbers, literals), logs (timestamps,
@@ -91,10 +100,24 @@ CI builds and tests all of these on every push; see `.github/workflows/`.
 ```sh
 cargo test --release                       # unit, property and headless-UI tests
 NOTEPAD_FAST_HUGE_GB=4 cargo test --release --test ui -- --ignored --nocapture   # multi-GB stress test
+scripts/e2e.sh native                      # real window: X11 keyboard/mouse/clipboard + real input methods
+scripts/e2e.sh wine                        # the same against the Windows .exe under Wine
 ```
 
-The UI tests drive the real application through egui with synthetic keyboard and mouse input (no window needed),
-including opening a 190 MB file, paging, searching, editing at both ends and saving.
+- **Headless UI tests** drive the real application through egui with synthetic input (no window needed):
+  typing in a dozen scripts, grapheme-aware cursor movement, IME composition/commit/cancel, clipboard,
+  mouse hit-testing on CJK/emoji text, word wrap, unicode find/replace, byte-exact round-trips (BOM, CRLF,
+  invalid UTF-8, NUL bytes), and a 190 MB file.
+- **End-to-end tests** (`scripts/e2e.sh`) start the actual binary in a virtual X display and use real X11 input
+  (xdotool), the real system clipboard (xclip) and real input methods (ibus Pinyin, Hangul, Kana-Kanji):
+  copy/cut/paste including 15–40 MB transfers, the Edit menu, undo/redo across saves, a 150 MB file, non-ASCII
+  file names, the unsaved-changes prompt, and (Windows build) the native Open/Save dialogs.
+  Needs `xvfb xdotool xclip imagemagick python3-xlib dbus-x11 ibus ibus-libpinyin ibus-hangul ibus-kkc` (+ `wine`).
+
+### Reporting input problems
+
+Set `NOTEPAD_FAST_DEBUG_INPUT` to a file path (e.g. `set NOTEPAD_FAST_DEBUG_INPUT=C:\temp\input.log` on Windows)
+before starting the app; every key, text, IME and clipboard event is logged there.
 
 ## Branches
 
@@ -103,5 +126,12 @@ See [BRANCHING.md](BRANCHING.md). In short: features → `develop` → `staging`
 ## Limitations
 
 - Text is treated as UTF-8 (other encodings display with replacement characters but are saved byte-for-byte).
-- Saving clears the undo history (undo steps reference the previous file's bytes).
+- On Linux/X11 the clipboard is limited to about 15 MB per copy (the X11 clipboard backend sends data in one
+  request); larger copies show a message instead. Windows, macOS and Wayland have no such limit (tested 40 MB).
+- Emoji are drawn in monochrome (egui has no colour-font support).
+- On Windows, after saving over a file the original is kept as a hidden `.<name>.notepad-fast-undo-N.tmp` file
+  next to it while the document is open (so undo still works); it is removed when the document is closed, or
+  the next time that file is opened if the app crashed.
+- Korean IME: verified with a real input method on Linux; under Wine's IME emulation one jamo can be lost when
+  a syllable completes (Wine's bridge, it also happens in egui's own text fields). Not yet verified on real Windows.
 - If another program truncates a file while it is open, reading the missing part may fail — the usual trade-off of memory-mapped viewers.

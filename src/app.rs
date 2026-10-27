@@ -17,6 +17,8 @@ use crate::theme::{self, ThemeKind};
 pub const APP_NAME: &str = "notepad-fast";
 const SETTINGS_KEY: &str = "notepad-fast-settings";
 const EDITOR_ID: &str = "notepad-fast-editor";
+const FIND_FIELD_ID: &str = "find-field";
+const REPLACE_FIELD_ID: &str = "replace-field";
 const MIN_FONT: f32 = 8.0;
 const MAX_FONT: f32 = 48.0;
 const DEFAULT_FONT: f32 = 15.0;
@@ -727,7 +729,7 @@ impl NotepadApp {
                 egui::TextEdit::singleline(&mut self.find.needle)
                     .hint_text("Find")
                     .desired_width(260.0)
-                    .id(Id::unique("find-field")),
+                    .id(Id::unique(FIND_FIELD_ID)),
             );
             if self.find.focus {
                 resp.request_focus();
@@ -763,7 +765,8 @@ impl NotepadApp {
                 let resp = ui.add(
                     egui::TextEdit::singleline(&mut self.find.replacement)
                         .hint_text("Replace with")
-                        .desired_width(260.0),
+                        .desired_width(260.0)
+                        .id(Id::unique(REPLACE_FIELD_ID)),
                 );
                 if resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
                     self.replace_one();
@@ -829,7 +832,9 @@ impl NotepadApp {
                 ui.label(format!("Do you want to save changes to {name}?"));
                 ui.add_space(10.0);
                 ui.horizontal(|ui| {
-                    if ui.button("Save").clicked() {
+                    // Enter = Save (the default button), Esc = Cancel.
+                    let save = egui::Button::new(RichText::new("Save").strong());
+                    if ui.add(save).clicked() || ui.input(|i| i.key_pressed(Key::Enter)) {
                         choice = Some(0);
                     }
                     if ui.button("Don't Save").clicked() {
@@ -1013,6 +1018,16 @@ impl NotepadApp {
             egui::Panel::bottom("status")
                 .frame(egui::Frame::new().fill(p.panel).inner_margin(egui::Margin::symmetric(10, 3)))
                 .show(ui, |ui| self.status_bar(ui));
+        }
+        // Keyboard focus returns to the text after using a menu, a button or
+        // clicking anywhere outside a text field (egui drops focus on those
+        // clicks, which would otherwise swallow the next shortcut or keystroke).
+        if !modal_open && !ctx.any_popup_open() {
+            let focused = ctx.memory(|m| m.focused());
+            let in_field = focused.is_some_and(|f| f == Id::unique(FIND_FIELD_ID) || f == Id::unique(REPLACE_FIELD_ID));
+            if focused != Some(Id::unique(EDITOR_ID)) && !in_field {
+                self.editor.request_focus = true;
+            }
         }
         egui::CentralPanel::default().frame(egui::Frame::new().fill(p.bg)).show(ui, |ui| {
             if self.loading.is_some() {

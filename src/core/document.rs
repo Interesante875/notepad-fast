@@ -1,10 +1,15 @@
-//! A piece-table document over a memory-mapped original buffer.
+//! A piece-table document over memory-mapped files.
 //!
 //! Opening a file never copies it: the document starts as one piece that
 //! points at the mapped file. Edits only append to a small "add" buffer and
 //! split pieces, so inserting a character into a 20 GB log is as cheap as
 //! inserting it into a 20 byte note. Every piece caches its newline count,
 //! which together with the sparse [`LineIndex`] gives fast line lookups.
+//!
+//! Saving writes a new file and moves it into place, but the document keeps
+//! reading the bytes it was opened from (on Unix the replaced file lives on
+//! while mapped; on Windows it is renamed aside), so undo and redo keep
+//! working across saves.
 
 use std::borrow::Cow;
 use std::fs::{self, File};
@@ -15,9 +20,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use memchr::memmem;
+use unicode_segmentation::UnicodeSegmentation;
 
-use super::index::{IndexBuilder, LineIndex, CHECKPOINT_BYTES};
-use super::source::{map_file, Bytes, Source};
+use super::index::{LineIndex, CHECKPOINT_BYTES};
+use super::source::{map_file, Source};
 
 /// (anchor, cursor) byte offsets. Stored with undo groups so undo/redo can
 /// restore the selection.
@@ -25,6 +31,7 @@ pub type Sel = (u64, u64);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Piece {
+    /// In the add buffer (typed / pasted text) rather than the opened file.
     add: bool,
     start: u64,
     len: u64,
@@ -63,6 +70,9 @@ pub enum FindStep {
     Pending(u64),
 }
 
+/// Bytes examined around the cursor when finding grapheme boundaries.
+const GRAPHEME_WINDOW: u64 = 256;
+
 /// Maximum number of matches `replace_all` will process in one go.
 pub const MAX_REPLACE_ALL: usize = 10_000_000;
 
@@ -88,9 +98,10 @@ impl Default for Document {
 
 /// Map and index a file, reporting progress. `Ok(None)` means cancelled.
 pub fn load_source(path: &Path, progress: &AtomicU64, cancel: &AtomicBool) -> io::Result<Option<Source>> {
+    remove_stale_undo_files(path);
     let bytes = map_file(path)?;
     match LineIndex::build_with_progress(bytes.as_slice(), progress, cancel) {
-        Some(index) => Ok(Some(Source { bytes, index, path: Some(path.to_path_buf()) })),
+        Some(index) => Ok(Some(Source { bytes, index })),
         None => Ok(None),
     }
 }
@@ -110,7 +121,11 @@ impl Document {
             seal_typing: false,
             version: 0,
         };
-        d.reset_to_orig();
+        if !d.orig.is_empty() {
+            let (len, newlines) = (d.orig.len(), d.orig.index.total_newlines());
+            d.pieces.push(Piece { add: false, start: 0, len, newlines });
+        }
+        d.rebuild_prefix(0);
         d
     }
 
@@ -121,16 +136,6 @@ impl Document {
     pub fn open(path: &Path) -> io::Result<Self> {
         let src = load_source(path, &AtomicU64::new(0), &AtomicBool::new(false))?.expect("not cancelled");
         Ok(Self::from_source(src))
-    }
-
-    fn reset_to_orig(&mut self) {
-        self.pieces.clear();
-        let len = self.orig.len();
-        if len > 0 {
-            self.pieces.push(Piece { add: false, start: 0, len, newlines: self.orig.index.total_newlines() });
-        }
-        self.rebuild_prefix(0);
-        self.version += 1;
     }
 
     // ---------------------------------------------------------------- queries
@@ -247,9 +252,8 @@ impl Document {
         let rel = if p.add {
             memchr::memchr_iter(b'\n', self.piece_bytes(p)).nth(need as usize - 1).unwrap() as u64 + 1
         } else {
-            let data = self.orig.data();
-            let n0 = self.orig.index.newlines_before(data, p.start);
-            self.orig.index.pos_after_nth_newline(data, n0 + need).unwrap() - p.start
+            let (idx, data) = (&self.orig.index, self.orig.data());
+            idx.pos_after_nth_newline(data, idx.newlines_before(data, p.start) + need).unwrap() - p.start
         };
         self.byte_prefix[k] + rel
     }
@@ -288,8 +292,45 @@ impl Document {
         self.nl_prefix[k] + inner
     }
 
-    /// Next cursor position after `pos` (skips whole UTF-8 sequences and CRLF).
+    /// Next cursor position after `pos`: one user-perceived character
+    /// (grapheme cluster), so CRLF, emoji sequences, combining accents and
+    /// Indic syllables are stepped over as a unit. Invalid UTF-8 bytes are
+    /// stepped over one at a time.
     pub fn next_boundary(&self, pos: u64) -> u64 {
+        let len = self.len();
+        if pos >= len {
+            return len;
+        }
+        let w = self.read(pos..(pos + GRAPHEME_WINDOW).min(len));
+        let valid = w.utf8_chunks().next().map_or("", |c| c.valid());
+        match valid.graphemes(true).next() {
+            Some(g) => pos + g.len() as u64,
+            None => self.next_char_boundary(pos),
+        }
+    }
+
+    /// Previous cursor position before `pos` (see [`Self::next_boundary`]).
+    pub fn prev_boundary(&self, pos: u64) -> u64 {
+        if pos == 0 {
+            return 0;
+        }
+        let pos = pos.min(self.len());
+        let w = self.read(pos.saturating_sub(GRAPHEME_WINDOW)..pos);
+        // Only the valid UTF-8 tail of the window is segmented.
+        let mut tail = "";
+        for chunk in w.utf8_chunks() {
+            tail = if chunk.invalid().is_empty() { chunk.valid() } else { "" };
+        }
+        // The window may start inside a character; its first chars may be
+        // mis-segmented, but the last cluster is still correct.
+        match tail.graphemes(true).next_back() {
+            Some(g) => pos - g.len() as u64,
+            None => self.prev_char_boundary(pos),
+        }
+    }
+
+    /// Next position after `pos`, stepping one Unicode scalar (or CRLF).
+    pub fn next_char_boundary(&self, pos: u64) -> u64 {
         let len = self.len();
         if pos >= len {
             return len;
@@ -306,8 +347,8 @@ impl Document {
         }
     }
 
-    /// Previous cursor position before `pos`.
-    pub fn prev_boundary(&self, pos: u64) -> u64 {
+    /// Previous position before `pos`, stepping one Unicode scalar (or CRLF).
+    pub fn prev_char_boundary(&self, pos: u64) -> u64 {
         if pos == 0 {
             return 0;
         }
@@ -332,11 +373,11 @@ impl Document {
     // ---------------------------------------------------------------- editing
 
     fn make_piece(&self, add: bool, start: u64, len: u64) -> Piece {
+        let r = start as usize..(start + len) as usize;
         let newlines = if add {
-            memchr::memchr_iter(b'\n', &self.add[start as usize..(start + len) as usize]).count() as u64
+            memchr::memchr_iter(b'\n', &self.add[r]).count() as u64
         } else if len <= 2 * CHECKPOINT_BYTES {
-            let d = &self.orig.data()[start as usize..(start + len) as usize];
-            memchr::memchr_iter(b'\n', d).count() as u64
+            memchr::memchr_iter(b'\n', &self.orig.data()[r]).count() as u64
         } else {
             self.orig.newlines_in(start, start + len)
         };
@@ -616,35 +657,44 @@ impl Document {
     }
 
     /// Second half of a save: move the temp file written by
-    /// [`SaveSnapshot::write_temp`] into place and map it. Undo history is
-    /// cleared because it refers to the previous file's bytes.
+    /// [`SaveSnapshot::write_temp`] into place and mark the save point.
+    /// Undo and redo history is kept.
     pub fn commit_save(&mut self, path: &Path, written: WrittenFile) -> io::Result<()> {
-        let WrittenFile { tmp, index } = written;
-        // Windows refuses to replace a file that is still mapped, so drop our
-        // mapping before the rename, keeping just enough to re-map it if the
-        // rename fails.
-        let released = if cfg!(windows) && matches!(*self.orig.bytes, Bytes::Mapped(_)) {
-            let old = std::mem::replace(&mut self.orig, Arc::new(Source::empty()));
-            Some((old.path.clone(), old.index.clone()))
-        } else {
-            None
-        };
-        if let Err(e) = fs::rename(&tmp, path) {
-            let _ = fs::remove_file(&tmp);
-            if let Some((Some(p), old_index)) = released {
-                self.orig = Arc::new(Source { bytes: map_file(&p)?, index: old_index, path: Some(p) });
+        // Windows refuses to overwrite a file that is memory-mapped. If we map
+        // `path`, rename it aside first (allowed while mapped); its bytes stay
+        // readable for the document and undo, and the renamed file is deleted
+        // when the document is closed.
+        let aside = if cfg!(windows) { self.move_mapped_aside(path)? } else { None };
+        if let Err(e) = fs::rename(&written.tmp, path) {
+            let _ = fs::remove_file(&written.tmp);
+            if let Some(aside_path) = aside {
+                if fs::rename(&aside_path, path).is_ok() {
+                    self.orig.bytes.set_location(path.to_path_buf(), false);
+                }
             }
             return Err(e);
         }
-
-        let bytes = map_file(path)?;
-        self.orig = Arc::new(Source { bytes, index, path: Some(path.to_path_buf()) });
-        self.add.clear();
-        self.undo.clear();
-        self.redo.clear();
-        self.saved_group_id = 0;
-        self.reset_to_orig();
+        self.saved_group_id = self.undo.last().map_or(0, |g| g.id);
+        self.seal_typing = true;
         Ok(())
+    }
+
+    /// Rename the file at `path` aside if the document maps it.
+    fn move_mapped_aside(&self, path: &Path) -> io::Result<Option<PathBuf>> {
+        if !self.orig.bytes.maps(path) {
+            return Ok(None);
+        }
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let aside = (0..1000)
+            .map(|k| path.with_file_name(format!(".{name}.notepad-fast-undo-{k}.tmp")))
+            .find(|p| !p.exists())
+            .ok_or_else(|| io::Error::other("too many undo files"))?;
+        fs::rename(path, &aside)?;
+        // Newer Windows versions may allow deleting it right away (the mapped
+        // bytes stay readable); otherwise delete it when the mapping goes.
+        let deleted = fs::remove_file(&aside).is_ok();
+        self.orig.bytes.set_location(aside.clone(), !deleted);
+        Ok(Some(aside))
     }
 }
 
@@ -658,7 +708,6 @@ pub struct SaveSnapshot {
 /// A fully written temp file waiting to be renamed over the target.
 pub struct WrittenFile {
     tmp: PathBuf,
-    index: LineIndex,
 }
 
 impl SaveSnapshot {
@@ -670,11 +719,10 @@ impl SaveSnapshot {
         self.len() == 0
     }
 
-    /// Write everything to a temp file next to `path`, indexing as we go.
+    /// Write everything to a temp file next to `path`.
     /// `progress` receives the number of bytes written.
     pub fn write_temp(&self, path: &Path, progress: &AtomicU64, cancel: &AtomicBool) -> io::Result<WrittenFile> {
         let tmp = temp_path(path);
-        let mut index = IndexBuilder::new();
         let res = (|| {
             let f = File::create(&tmp)?;
             let mut w = BufWriter::with_capacity(8 << 20, f);
@@ -686,7 +734,6 @@ impl SaveSnapshot {
                         return Err(io::Error::new(io::ErrorKind::Interrupted, "save cancelled"));
                     }
                     w.write_all(chunk)?;
-                    index.feed(chunk);
                     progress.fetch_add(chunk.len() as u64, Ordering::Relaxed);
                 }
             }
@@ -694,11 +741,25 @@ impl SaveSnapshot {
             f.sync_all()
         })();
         match res {
-            Ok(()) => Ok(WrittenFile { tmp, index: index.finish() }),
+            Ok(()) => Ok(WrittenFile { tmp }),
             Err(e) => {
                 let _ = fs::remove_file(&tmp);
                 Err(e)
             }
+        }
+    }
+}
+
+/// Remove undo files left next to `path` by an instance that crashed.
+/// Files still in use by a running instance cannot be deleted and are kept.
+pub fn remove_stale_undo_files(path: &Path) {
+    let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else { return };
+    let prefix = format!(".{}.notepad-fast-undo-", name.to_string_lossy());
+    let Ok(entries) = fs::read_dir(if dir.as_os_str().is_empty() { Path::new(".") } else { dir }) else { return };
+    for e in entries.flatten() {
+        let n = e.file_name().to_string_lossy().into_owned();
+        if n.starts_with(&prefix) && n.ends_with(".tmp") {
+            let _ = fs::remove_file(e.path());
         }
     }
 }
