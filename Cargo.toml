@@ -1,0 +1,38 @@
+[package]
+name = "notepad-fast"
+version = "0.1.0"
+edition = "2021"
+description = "A Notepad-style editor that opens ultra-large text, JSON, JSONL, Markdown and log files instantly"
+license = "MIT"
+default-run = "notepad-fast"
+
+[lib]
+name = "notepad_fast"
+path = "src/lib.rs"
+
+[[bin]]
+name = "notepad-fast"
+path = "src/main.rs"
+
+[dependencies]
+memchr = "2.7"
+memmap2 = "0.9"
+eframe = { version = "0.37", default-features = false, features = ["default_fonts", "glow", "persistence", "wayland", "x11"] }
+egui = "0.37"
+rfd = "0.17"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
+
+# Optimise dependencies (memchr, egui) even in dev/test builds so large-file
+# tests and debugging sessions stay fast.
+[profile.dev.package."*"]
+opt-level = 3
